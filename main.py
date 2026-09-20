@@ -1,4 +1,3 @@
-
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import (
     Security,
@@ -391,6 +390,7 @@ def make_recruiter(
     user_id: str,
     user: dict = Depends(get_current_user)
 ):
+
     require_role(user, "admin")
 
     result = (
@@ -404,6 +404,7 @@ def make_recruiter(
     )
 
     if not result.data:
+
         raise HTTPException(
             status_code=404,
             detail="User not found"
@@ -422,48 +423,84 @@ def make_recruiter(
 def get_recruiters(
     user: dict = Depends(get_current_user)
 ):
+
     require_role(user, "admin")
 
     # Get all recruiters
     recruiters_result = (
         supabase
         .table("users")
-        .select("id,name,email,phone,is_active,role")
+        .select(
+            "id,name,email,phone,is_active,role"
+        )
         .eq("role", "recruiter")
         .execute()
     )
 
-    recruiters = []
+    recruiters = recruiters_result.data or []
 
-    for recruiter in recruiters_result.data:
+    if not recruiters:
+        return []
 
-        # Get jobs assigned to this recruiter
-        assignments = (
+    # Get recruiter IDs
+    recruiter_ids = [
+        recruiter["id"]
+        for recruiter in recruiters
+    ]
+
+    # Get all assignments in one request
+    assignments_result = (
+        supabase
+        .table("job_recruiters")
+        .select("job_id,recruiter_id")
+        .in_("recruiter_id", recruiter_ids)
+        .execute()
+    )
+
+    assignments = assignments_result.data or []
+
+    # Get all job IDs
+    job_ids = list({
+        assignment["job_id"]
+        for assignment in assignments
+    })
+
+    jobs_by_id = {}
+
+    # Get all assigned jobs in one request
+    if job_ids:
+
+        jobs_result = (
             supabase
-            .table("job_recruiters")
-            .select("job_id")
-            .eq("recruiter_id", recruiter["id"])
+            .table("jobs")
+            .select("*")
+            .in_("id", job_ids)
             .execute()
         )
 
+        for job in jobs_result.data or []:
+
+            jobs_by_id[job["id"]] = job
+
+    # Build final recruiter response
+    result = []
+
+    for recruiter in recruiters:
+
         assigned_jobs = []
 
-        for assignment in assignments.data:
+        for assignment in assignments:
 
-            job_result = (
-                supabase
-                .table("jobs")
-                .select("*")
-                .eq("id", assignment["job_id"])
-                .execute()
-            )
+            if assignment["recruiter_id"] == recruiter["id"]:
 
-            if job_result.data:
-                assigned_jobs.append(
-                    job_result.data[0]
+                job = jobs_by_id.get(
+                    assignment["job_id"]
                 )
 
-        recruiters.append({
+                if job:
+                    assigned_jobs.append(job)
+
+        result.append({
             "id": recruiter["id"],
             "name": recruiter["name"],
             "email": recruiter["email"],
@@ -473,7 +510,7 @@ def get_recruiters(
             "assigned_jobs": assigned_jobs
         })
 
-    return recruiters
+    return result
 
 
 # ===================================================
@@ -485,6 +522,7 @@ def deactivate_recruiter(
     user_id: str,
     user: dict = Depends(get_current_user)
 ):
+
     require_role(user, "admin")
 
     result = (
@@ -498,6 +536,7 @@ def deactivate_recruiter(
     )
 
     if not result.data:
+
         raise HTTPException(
             status_code=404,
             detail="Recruiter not found"
@@ -512,15 +551,18 @@ def deactivate_recruiter(
 # ADMIN — ASSIGN RECRUITER TO JOB
 # ===================================================
 
-@app.post("/admin/jobs/{job_id}/recruiters/{recruiter_id}")
+@app.post(
+    "/admin/jobs/{job_id}/recruiters/{recruiter_id}"
+)
 def assign_recruiter(
     job_id: str,
     recruiter_id: str,
     user: dict = Depends(get_current_user)
 ):
+
     require_role(user, "admin")
 
-    # Check recruiter exists
+    # Check recruiter
     recruiter = (
         supabase
         .table("users")
@@ -531,12 +573,13 @@ def assign_recruiter(
     )
 
     if not recruiter.data:
+
         raise HTTPException(
             status_code=404,
             detail="Recruiter not found"
         )
 
-    # Check job exists
+    # Check job
     job = (
         supabase
         .table("jobs")
@@ -546,12 +589,13 @@ def assign_recruiter(
     )
 
     if not job.data:
+
         raise HTTPException(
             status_code=404,
             detail="Job not found"
         )
 
-    # Check if already assigned
+    # Check duplicate assignment
     existing = (
         supabase
         .table("job_recruiters")
@@ -562,6 +606,7 @@ def assign_recruiter(
     )
 
     if existing.data:
+
         return {
             "message": "Recruiter is already assigned to this job",
             "data": existing.data
@@ -599,6 +644,7 @@ async def apply_job(
 
     # Check file type
     if file.content_type != "application/pdf":
+
         raise HTTPException(
             status_code=400,
             detail="Only PDF CV is allowed"
@@ -609,6 +655,7 @@ async def apply_job(
 
     # Maximum 2 MB
     if len(cv_data) > 2 * 1024 * 1024:
+
         raise HTTPException(
             status_code=400,
             detail="CV must be 2 MB or smaller"
@@ -624,6 +671,7 @@ async def apply_job(
     )
 
     if not job_result.data:
+
         raise HTTPException(
             status_code=404,
             detail="Job not found"
@@ -631,8 +679,9 @@ async def apply_job(
 
     job = job_result.data[0]
 
-    # Check job
+    # Check job status
     if not check_job_open(job):
+
         raise HTTPException(
             status_code=400,
             detail="This job is closed or expired"
@@ -643,22 +692,32 @@ async def apply_job(
         supabase
         .table("applications")
         .select("*")
-        .eq("candidate_id", user["user_id"])
-        .eq("job_id", job_id)
-        .neq("stage", "Withdrawn")
+        .eq(
+            "candidate_id",
+            user["user_id"]
+        )
+        .eq(
+            "job_id",
+            job_id
+        )
+        .neq(
+            "stage",
+            "Withdrawn"
+        )
         .execute()
     )
 
     if existing.data:
+
         raise HTTPException(
             status_code=400,
             detail="You already applied for this job"
         )
 
-    # Generate unique CV filename
+    # Generate unique filename
     filename = f"{uuid.uuid4()}.pdf"
 
-    # Upload CV first
+    # Upload CV
     try:
 
         supabase.storage.from_("cvs").upload(
@@ -676,7 +735,7 @@ async def apply_job(
             detail=f"CV upload failed: {str(e)}"
         )
 
-    # Create application with CV URL
+    # Create application
     try:
 
         application = (
@@ -693,9 +752,12 @@ async def apply_job(
 
     except Exception as e:
 
-        # Delete uploaded CV if database insert fails
         try:
-            supabase.storage.from_("cvs").remove([filename])
+
+            supabase.storage.from_(
+                "cvs"
+            ).remove([filename])
+
         except:
             pass
 
@@ -707,7 +769,11 @@ async def apply_job(
     if not application.data:
 
         try:
-            supabase.storage.from_("cvs").remove([filename])
+
+            supabase.storage.from_(
+                "cvs"
+            ).remove([filename])
+
         except:
             pass
 
@@ -718,7 +784,7 @@ async def apply_job(
 
     application_id = application.data[0]["id"]
 
-    # Send automation email
+    # Send email automation
     send_n8n_email(
         "application_received",
         application_id
@@ -730,8 +796,6 @@ async def apply_job(
         "stage": "Applied",
         "cv_url": filename
     }
-
-
 
 
 # ===================================================
@@ -749,7 +813,10 @@ def my_applications(
         supabase
         .table("applications")
         .select("*, jobs(*)")
-        .eq("candidate_id", user["user_id"])
+        .eq(
+            "candidate_id",
+            user["user_id"]
+        )
         .execute()
     )
 
@@ -774,8 +841,14 @@ def withdraw_application(
         supabase
         .table("applications")
         .select("*")
-        .eq("id", application_id)
-        .eq("candidate_id", user["user_id"])
+        .eq(
+            "id",
+            application_id
+        )
+        .eq(
+            "candidate_id",
+            user["user_id"]
+        )
         .execute()
     )
 
@@ -804,7 +877,10 @@ def withdraw_application(
         .update({
             "stage": "Withdrawn"
         })
-        .eq("id", application_id)
+        .eq(
+            "id",
+            application_id
+        )
         .execute()
     )
 
@@ -825,26 +901,58 @@ def recruiter_jobs(
 
     require_role(user, "recruiter")
 
-    result = (
+    recruiter_id = user["user_id"]
+
+    # Get assigned job IDs
+    assignments_result = (
         supabase
         .table("job_recruiters")
-        .select("*, jobs(*)")
-        .eq("recruiter_id", user["user_id"])
+        .select("job_id")
+        .eq(
+            "recruiter_id",
+            recruiter_id
+        )
         .execute()
     )
 
-    return result.data
+    assignments = assignments_result.data or []
+
+    if not assignments:
+        return []
+
+    # Get job IDs
+    job_ids = list({
+        assignment["job_id"]
+        for assignment in assignments
+    })
+
+    # Get all jobs in one request
+    jobs_result = (
+        supabase
+        .table("jobs")
+        .select("*")
+        .in_(
+            "id",
+            job_ids
+        )
+        .execute()
+    )
+
+    return jobs_result.data or []
 
 
 # ===================================================
 # RECRUITER — APPLICATIONS
 # ===================================================
 
-@app.get("/recruiter/jobs/{job_id}/applications")
+@app.get(
+    "/recruiter/jobs/{job_id}/applications"
+)
 def recruiter_applications(
     job_id: str,
     user: dict = Depends(get_current_user)
 ):
+
     require_role(user, "recruiter")
 
     recruiter_id = user["user_id"]
@@ -853,28 +961,42 @@ def recruiter_applications(
     assignment = (
         supabase
         .table("job_recruiters")
-        .select("job_id,recruiter_id")
-        .eq("job_id", job_id)
-        .eq("recruiter_id", recruiter_id)
+        .select(
+            "job_id,recruiter_id"
+        )
+        .eq(
+            "job_id",
+            job_id
+        )
+        .eq(
+            "recruiter_id",
+            recruiter_id
+        )
         .execute()
     )
 
     if not assignment.data:
+
         raise HTTPException(
             status_code=403,
             detail="You are not assigned to this job"
         )
 
-    # Get applications for this job
+    # Get applications
     result = (
         supabase
         .table("applications")
         .select("*")
-        .eq("job_id", job_id)
+        .eq(
+            "job_id",
+            job_id
+        )
         .execute()
     )
 
     return result.data
+
+
 # ===================================================
 # RECRUITER — APPLICATION STAGE
 # ===================================================
@@ -894,7 +1016,10 @@ def change_stage(
         supabase
         .table("applications")
         .select("*")
-        .eq("id", application_id)
+        .eq(
+            "id",
+            application_id
+        )
         .execute()
     )
 
@@ -913,8 +1038,14 @@ def change_stage(
         supabase
         .table("job_recruiters")
         .select("*")
-        .eq("job_id", job_id)
-        .eq("recruiter_id", user["user_id"])
+        .eq(
+            "job_id",
+            job_id
+        )
+        .eq(
+            "recruiter_id",
+            user["user_id"]
+        )
         .execute()
     )
 
@@ -996,7 +1127,10 @@ def change_stage(
         .update({
             "stage": new_stage
         })
-        .eq("id", application_id)
+        .eq(
+            "id",
+            application_id
+        )
         .execute()
     )
 
@@ -1018,7 +1152,10 @@ def change_stage(
             supabase
             .table("jobs")
             .select("*")
-            .eq("id", job_id)
+            .eq(
+                "id",
+                job_id
+            )
             .execute()
         )
 
@@ -1030,16 +1167,26 @@ def change_stage(
                 supabase
                 .table("applications")
                 .select("id")
-                .eq("job_id", job_id)
-                .eq("stage", "Hired")
+                .eq(
+                    "job_id",
+                    job_id
+                )
+                .eq(
+                    "stage",
+                    "Hired"
+                )
                 .execute()
             )
 
-            hired_count = len(hired_result.data)
+            hired_count = len(
+                hired_result.data
+            )
 
             if hired_count >= job["openings"]:
 
-                supabase.table("jobs").update({
+                supabase.table(
+                    "jobs"
+                ).update({
                     "status": "Closed"
                 }).eq(
                     "id",
@@ -1067,7 +1214,9 @@ def change_stage(
 
                 for app in remaining.data:
 
-                    supabase.table("applications").update({
+                    supabase.table(
+                        "applications"
+                    ).update({
                         "stage": "Rejected"
                     }).eq(
                         "id",
@@ -1111,7 +1260,10 @@ def schedule_interview(
         supabase
         .table("applications")
         .select("*")
-        .eq("id", application_id)
+        .eq(
+            "id",
+            application_id
+        )
         .execute()
     )
 
@@ -1140,8 +1292,14 @@ def schedule_interview(
         supabase
         .table("job_recruiters")
         .select("*")
-        .eq("job_id", job_id)
-        .eq("recruiter_id", user["user_id"])
+        .eq(
+            "job_id",
+            job_id
+        )
+        .eq(
+            "recruiter_id",
+            user["user_id"]
+        )
         .execute()
     )
 
@@ -1183,8 +1341,14 @@ def schedule_interview(
         supabase
         .table("interviews")
         .select("*")
-        .eq("recruiter_id", user["user_id"])
-        .eq("interview_date", data.interview_date)
+        .eq(
+            "recruiter_id",
+            user["user_id"]
+        )
+        .eq(
+            "interview_date",
+            data.interview_date
+        )
         .execute()
     )
 
@@ -1235,7 +1399,9 @@ def schedule_interview(
         .execute()
     )
 
-    supabase.table("applications").update({
+    supabase.table(
+        "applications"
+    ).update({
         "stage": "Interview"
     }).eq(
         "id",
@@ -1272,7 +1438,10 @@ def add_note(
         supabase
         .table("applications")
         .select("*")
-        .eq("id", application_id)
+        .eq(
+            "id",
+            application_id
+        )
         .execute()
     )
 
@@ -1335,84 +1504,102 @@ def admin_dashboard(
 
     require_role(user, "admin")
 
-    jobs = (
+    # Get all jobs
+    jobs_result = (
         supabase
         .table("jobs")
-        .select("*")
+        .select("id,status")
         .execute()
     )
 
-    applications = (
+    # Get all applications
+    applications_result = (
         supabase
         .table("applications")
-        .select("*")
+        .select("id,stage")
         .execute()
     )
 
-    recruiters = (
+    # Get all recruiters
+    recruiters_result = (
         supabase
         .table("users")
         .select("id")
-        .eq("role", "recruiter")
+        .eq(
+            "role",
+            "recruiter"
+        )
         .execute()
     )
 
+    jobs = jobs_result.data or []
+    applications = applications_result.data or []
+    recruiters = recruiters_result.data or []
+
     return {
-        "total_jobs": len(jobs.data),
+        "total_jobs": len(jobs),
 
-        "open_jobs": len([
-            j for j in jobs.data
-            if j["status"] == "Open"
-        ]),
-
-        "closed_jobs": len([
-            j for j in jobs.data
-            if j["status"] == "Closed"
-        ]),
-
-        "total_applications": len(
-            applications.data
+        "open_jobs": sum(
+            1
+            for job in jobs
+            if job.get("status") == "Open"
         ),
 
-        "applied": len([
-            a for a in applications.data
-            if a["stage"] == "Applied"
-        ]),
+        "closed_jobs": sum(
+            1
+            for job in jobs
+            if job.get("status") == "Closed"
+        ),
 
-        "shortlisted": len([
-            a for a in applications.data
-            if a["stage"] == "Shortlisted"
-        ]),
+        "total_applications": len(
+            applications
+        ),
 
-        "interview": len([
-            a for a in applications.data
-            if a["stage"] == "Interview"
-        ]),
+        "applied": sum(
+            1
+            for app in applications
+            if app.get("stage") == "Applied"
+        ),
 
-        "offer": len([
-            a for a in applications.data
-            if a["stage"] == "Offer"
-        ]),
+        "shortlisted": sum(
+            1
+            for app in applications
+            if app.get("stage") == "Shortlisted"
+        ),
 
-        "hired": len([
-            a for a in applications.data
-            if a["stage"] == "Hired"
-        ]),
+        "interview": sum(
+            1
+            for app in applications
+            if app.get("stage") == "Interview"
+        ),
 
-        "rejected": len([
-            a for a in applications.data
-            if a["stage"] == "Rejected"
-        ]),
+        "offer": sum(
+            1
+            for app in applications
+            if app.get("stage") == "Offer"
+        ),
 
-        "withdrawn": len([
-            a for a in applications.data
-            if a["stage"] == "Withdrawn"
-        ]),
+        "hired": sum(
+            1
+            for app in applications
+            if app.get("stage") == "Hired"
+        ),
+
+        "rejected": sum(
+            1
+            for app in applications
+            if app.get("stage") == "Rejected"
+        ),
+
+        "withdrawn": sum(
+            1
+            for app in applications
+            if app.get("stage") == "Withdrawn"
+        ),
 
         "total_recruiters": len(
-            recruiters.data
+            recruiters
         )
     }
-
 
 
