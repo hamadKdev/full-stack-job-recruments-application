@@ -386,6 +386,10 @@ def admin_jobs(
 # ADMIN — RECRUITERS
 # ===================================================
 
+# ===================================================
+# ADMIN — RECRUITERS
+# ===================================================
+
 @app.post("/admin/recruiters/{user_id}")
 def make_recruiter(
     user_id: str,
@@ -405,7 +409,6 @@ def make_recruiter(
     )
 
     if not result.data:
-
         raise HTTPException(
             status_code=404,
             detail="User not found"
@@ -416,38 +419,72 @@ def make_recruiter(
     }
 
 
-@app.get("/recruiter/jobs")
-def recruiter_jobs(
+@app.get("/admin/recruiters")
+def get_recruiters(
     user: dict = Depends(get_current_user)
 ):
 
-    require_role(user, "recruiter")
+    require_role(user, "admin")
 
-    # Get jobs assigned to this recruiter
-    assignments = (
+    # Get all recruiters
+    recruiters_result = (
         supabase
-        .table("job_recruiters")
-        .select("job_id")
-        .eq("recruiter_id", user["user_id"])
+        .table("users")
+        .select(
+            "id,name,email,phone,is_active,role"
+        )
+        .eq("role", "recruiter")
         .execute()
     )
 
-    jobs = []
+    recruiters = []
 
-    for assignment in assignments.data:
+    for recruiter in recruiters_result.data:
 
-        job_result = (
+        # Get jobs assigned to this recruiter
+        assignments = (
             supabase
-            .table("jobs")
-            .select("*")
-            .eq("id", assignment["job_id"])
+            .table("job_recruiters")
+            .select("job_id")
+            .eq(
+                "recruiter_id",
+                recruiter["id"]
+            )
             .execute()
         )
 
-        if job_result.data:
-            jobs.append(job_result.data[0])
+        assigned_jobs = []
 
-    return jobs
+        for assignment in assignments.data:
+
+            job_result = (
+                supabase
+                .table("jobs")
+                .select("*")
+                .eq(
+                    "id",
+                    assignment["job_id"]
+                )
+                .execute()
+            )
+
+            if job_result.data:
+                assigned_jobs.append(
+                    job_result.data[0]
+                )
+
+        recruiters.append({
+            "id": recruiter["id"],
+            "name": recruiter["name"],
+            "email": recruiter["email"],
+            "phone": recruiter["phone"],
+            "is_active": recruiter["is_active"],
+            "role": recruiter["role"],
+            "assigned_jobs": assigned_jobs
+        })
+
+    return recruiters
+
 
 @app.post("/admin/recruiters/{user_id}/deactivate")
 def deactivate_recruiter(
@@ -468,7 +505,6 @@ def deactivate_recruiter(
     )
 
     if not result.data:
-
         raise HTTPException(
             status_code=404,
             detail="Recruiter not found"
