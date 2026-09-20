@@ -527,29 +527,23 @@ async def apply_job(
     require_role(user, "candidate")
 
     # Check file type
-
     if file.content_type != "application/pdf":
-
         raise HTTPException(
             status_code=400,
             detail="Only PDF CV is allowed"
         )
 
     # Read CV
-
     cv_data = await file.read()
 
     # Maximum 2 MB
-
     if len(cv_data) > 2 * 1024 * 1024:
-
         raise HTTPException(
             status_code=400,
             detail="CV must be 2 MB or smaller"
         )
 
     # Get job
-
     job_result = (
         supabase
         .table("jobs")
@@ -559,7 +553,6 @@ async def apply_job(
     )
 
     if not job_result.data:
-
         raise HTTPException(
             status_code=404,
             detail="Job not found"
@@ -568,16 +561,13 @@ async def apply_job(
     job = job_result.data[0]
 
     # Check job
-
     if not check_job_open(job):
-
         raise HTTPException(
             status_code=400,
             detail="This job is closed or expired"
         )
 
     # Check duplicate application
-
     existing = (
         supabase
         .table("applications")
@@ -589,40 +579,15 @@ async def apply_job(
     )
 
     if existing.data:
-
         raise HTTPException(
             status_code=400,
             detail="You already applied for this job"
         )
 
-    # Create application
+    # Generate unique CV filename
+    filename = f"{uuid.uuid4()}.pdf"
 
-    application = (
-        supabase
-        .table("applications")
-        .insert({
-            "candidate_id": user["user_id"],
-            "job_id": job_id,
-            "stage": "Applied"
-        })
-        .execute()
-    )
-
-    if not application.data:
-
-        raise HTTPException(
-            status_code=500,
-            detail="Application could not be created"
-        )
-
-    application_id = application.data[0]["id"]
-
-    # Unique CV name
-
-    filename = (
-        f"{application_id}_{uuid.uuid4()}.pdf"
-    )
-
+    # Upload CV first
     try:
 
         supabase.storage.from_("cvs").upload(
@@ -633,25 +598,56 @@ async def apply_job(
             }
         )
 
-        supabase.table("applications").update({
-            "cv_url": filename
-        }).eq(
-            "id",
-            application_id
-        ).execute()
-
     except Exception as e:
-
-        supabase.table("applications").delete().eq(
-            "id",
-            application_id
-        ).execute()
 
         raise HTTPException(
             status_code=500,
             detail=f"CV upload failed: {str(e)}"
         )
 
+    # Create application with CV URL
+    try:
+
+        application = (
+            supabase
+            .table("applications")
+            .insert({
+                "candidate_id": user["user_id"],
+                "job_id": job_id,
+                "cv_url": filename,
+                "stage": "Applied"
+            })
+            .execute()
+        )
+
+    except Exception as e:
+
+        # Delete uploaded CV if database insert fails
+        try:
+            supabase.storage.from_("cvs").remove([filename])
+        except:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Application could not be created: {str(e)}"
+        )
+
+    if not application.data:
+
+        try:
+            supabase.storage.from_("cvs").remove([filename])
+        except:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail="Application could not be created"
+        )
+
+    application_id = application.data[0]["id"]
+
+    # Send automation email
     send_n8n_email(
         "application_received",
         application_id
@@ -660,8 +656,11 @@ async def apply_job(
     return {
         "message": "Application submitted successfully",
         "application_id": application_id,
-        "stage": "Applied"
+        "stage": "Applied",
+        "cv_url": filename
     }
+
+
 
 
 # ===================================================
