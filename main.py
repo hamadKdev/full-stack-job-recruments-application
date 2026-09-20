@@ -818,9 +818,7 @@ def recruiter_jobs(
 # RECRUITER — APPLICATIONS
 # ===================================================
 
-@app.get(
-    "/recruiter/jobs/{job_id}/applications"
-)
+@app.get("/recruiter/jobs/{job_id}/applications")
 def recruiter_applications(
     job_id: str,
     user: dict = Depends(get_current_user)
@@ -828,33 +826,32 @@ def recruiter_applications(
 
     require_role(user, "recruiter")
 
+    # Check recruiter assignment
     assignment = (
         supabase
         .table("job_recruiters")
-        .select("*")
+        .select("job_id,recruiter_id")
         .eq("job_id", job_id)
         .eq("recruiter_id", user["user_id"])
         .execute()
     )
 
     if not assignment.data:
-
         raise HTTPException(
             status_code=403,
             detail="You are not assigned to this job"
         )
 
+    # Get applications for this job
     result = (
         supabase
         .table("applications")
-        .select("*, users(*), jobs(*)")
+        .select("*")
         .eq("job_id", job_id)
         .execute()
     )
 
     return result.data
-
-
 # ===================================================
 # RECRUITER — APPLICATION STAGE
 # ===================================================
