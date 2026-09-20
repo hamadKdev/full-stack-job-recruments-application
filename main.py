@@ -845,16 +845,17 @@ def recruiter_applications(
     job_id: str,
     user: dict = Depends(get_current_user)
 ):
-
     require_role(user, "recruiter")
 
-    # Check recruiter assignment
+    recruiter_id = user["user_id"]
+
+    # Check assignment
     assignment = (
         supabase
         .table("job_recruiters")
         .select("job_id,recruiter_id")
         .eq("job_id", job_id)
-        .eq("recruiter_id", user["user_id"])
+        .eq("recruiter_id", recruiter_id)
         .execute()
     )
 
