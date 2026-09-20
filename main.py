@@ -416,25 +416,38 @@ def make_recruiter(
     }
 
 
-@app.get("/admin/recruiters")
-def get_recruiters(
+@app.get("/recruiter/jobs")
+def recruiter_jobs(
     user: dict = Depends(get_current_user)
 ):
 
-    require_role(user, "admin")
+    require_role(user, "recruiter")
 
-    result = (
+    # Get jobs assigned to this recruiter
+    assignments = (
         supabase
-        .table("users")
-        .select(
-            "id,name,email,phone,is_active,role"
-        )
-        .eq("role", "recruiter")
+        .table("job_recruiters")
+        .select("job_id")
+        .eq("recruiter_id", user["user_id"])
         .execute()
     )
 
-    return result.data
+    jobs = []
 
+    for assignment in assignments.data:
+
+        job_result = (
+            supabase
+            .table("jobs")
+            .select("*")
+            .eq("id", assignment["job_id"])
+            .execute()
+        )
+
+        if job_result.data:
+            jobs.append(job_result.data[0])
+
+    return jobs
 
 @app.post("/admin/recruiters/{user_id}/deactivate")
 def deactivate_recruiter(
