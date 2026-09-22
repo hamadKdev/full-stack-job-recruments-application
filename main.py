@@ -5,7 +5,8 @@ from fastapi import (
     FastAPI,
     UploadFile,
     File,
-    HTTPException
+    HTTPException,
+    Header
 )
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -18,6 +19,7 @@ from datetime import date, datetime, timedelta
 import os
 import requests
 import uuid
+import secrets
 
 
 app = FastAPI(
@@ -70,24 +72,131 @@ def require_role(user, role):
 
 
 def send_n8n_email(event_type, application_id):
+    """
+    Send an event to the existing n8n webhook.
 
+    The same webhook handles:
+    - application_received
+    - interview_scheduled
+    - hired
+    - rejected
+    - ai_summary_retry
+
+    For application_received / retry, extra application information is
+    included so n8n can download the CV and run the AI summary workflow.
+    """
     webhook = os.getenv("N8N_WEBHOOK_URL")
 
     if not webhook:
-        return
+        print("N8N_WEBHOOK_URL is not configured")
+        return False
 
     try:
-        requests.post(
+        application_result = (
+            supabase
+            .table("applications")
+            .select("*")
+            .eq("id", application_id)
+            .execute()
+        )
+
+        if not application_result.data:
+            print("Application not found for n8n:", application_id)
+            return False
+
+        application = application_result.data[0]
+
+        job_result = (
+            supabase
+            .table("jobs")
+            .select("*")
+            .eq("id", application["job_id"])
+            .execute()
+        )
+
+        job = job_result.data[0] if job_result.data else {}
+
+        candidate_result = (
+            supabase
+            .table("users")
+            .select("id,name,email")
+            .eq("id", application["candidate_id"])
+            .execute()
+        )
+
+        candidate = candidate_result.data[0] if candidate_result.data else {}
+
+        payload = {
+            "event_type": event_type,
+            "application_id": application_id,
+            "candidate_id": application.get("candidate_id"),
+            "candidate_name": candidate.get("name"),
+            "email": candidate.get("email"),
+            "job_id": application.get("job_id"),
+            "job_title": job.get("title"),
+            "job_requirements": job.get("requirements"),
+            "job_qualifications": job.get("qualifications"),
+            "cv_filename": application.get("cv_url"),
+        }
+
+        # Create a short-lived signed URL for n8n to download the CV.
+        # The CV bucket can remain private.
+        cv_filename = application.get("cv_url")
+        if cv_filename:
+            try:
+                signed = (
+                    supabase.storage
+                    .from_("cvs")
+                    .create_signed_url(cv_filename, 600)
+                )
+
+                if isinstance(signed, dict):
+                    payload["cv_signed_url"] = (
+                        signed.get("signedURL")
+                        or signed.get("signedUrl")
+                        or signed.get("signed_url")
+                    )
+            except Exception as e:
+                print("Could not create CV signed URL:", e)
+
+        response = requests.post(
             webhook,
-            json={
-                "event_type": event_type,
-                "application_id": application_id
-            },
+            json=payload,
             timeout=10
         )
 
+        response.raise_for_status()
+        return True
+
     except Exception as e:
         print("n8n error:", e)
+        return False
+
+
+def trigger_ai_summary(application_id, event_type="ai_summary_retry"):
+    """
+    Trigger only the AI summary branch.
+
+    This is deliberately separate from application_received so a retry
+    never sends another application-received email.
+    """
+    return send_n8n_email(event_type, application_id)
+
+
+def get_n8n_callback_secret():
+    return os.getenv("N8N_CALLBACK_SECRET", "")
+
+
+def verify_n8n_callback(secret_header):
+    expected = get_n8n_callback_secret()
+
+    if not expected or not secret_header:
+        return False
+
+    return secrets.compare_digest(
+        str(secret_header),
+        str(expected)
+    )
 
 
 def check_job_open(job):
@@ -745,7 +854,10 @@ async def apply_job(
                 "candidate_id": user["user_id"],
                 "job_id": job_id,
                 "cv_url": filename,
-                "stage": "Applied"
+                "stage": "Applied",
+                "ai_summary": None,
+                "ai_summary_status": "pending",
+                "ai_summary_generated_at": None
             })
             .execute()
         )
@@ -820,7 +932,15 @@ def my_applications(
         .execute()
     )
 
-    return result.data
+    applications = result.data or []
+
+    # AI summaries are private to admins and assigned recruiters.
+    for application in applications:
+        application.pop("ai_summary", None)
+        application.pop("ai_summary_status", None)
+        application.pop("ai_summary_generated_at", None)
+
+    return applications
 
 
 # ===================================================
@@ -888,6 +1008,242 @@ def withdraw_application(
         "message": "Application withdrawn",
         "application": updated.data
     }
+
+
+# ===================================================
+# AI CV SUMMARY — INTERNAL n8n CALLBACK
+# ===================================================
+
+@app.post("/internal/ai-summary")
+def save_ai_summary(
+    payload: dict,
+    x_n8n_secret: str = Header(default="")
+):
+    """
+    n8n calls this endpoint after the AI creates the summary.
+
+    n8n must send the secret in:
+    X-N8N-Secret: <N8N_CALLBACK_SECRET>
+
+    Expected JSON:
+    {
+        "application_id": "...",
+        "status": "completed",
+        "summary": {
+            "short_profile": ["...", "..."],
+            "requirements_mentioned": ["..."],
+            "requirements_not_found": ["..."],
+            "interview_questions": ["...", "...", "..."]
+        }
+    }
+
+    No JWT is used here because n8n is a server-to-server caller.
+    The secret protects this endpoint.
+    """
+    if not verify_n8n_callback(x_n8n_secret):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid n8n callback secret"
+        )
+
+    application_id = payload.get("application_id")
+    status = payload.get("status", "completed")
+
+    if not application_id:
+        raise HTTPException(
+            status_code=400,
+            detail="application_id is required"
+        )
+
+    if status == "failed":
+        result = (
+            supabase
+            .table("applications")
+            .update({
+                "ai_summary": None,
+                "ai_summary_status": "failed"
+            })
+            .eq("id", application_id)
+            .execute()
+        )
+
+        if not result.data:
+            raise HTTPException(
+                status_code=404,
+                detail="Application not found"
+            )
+
+        return {
+            "message": "AI summary marked as failed",
+            "application_id": application_id
+        }
+
+    summary = payload.get("summary")
+
+    if not summary:
+        raise HTTPException(
+            status_code=400,
+            detail="summary is required"
+        )
+
+    # Keep the stored structure limited to the exact 3 PRD sections.
+    clean_summary = {
+        "short_profile": summary.get("short_profile", []),
+        "requirements_mentioned": summary.get(
+            "requirements_mentioned",
+            []
+        ),
+        "requirements_not_found": summary.get(
+            "requirements_not_found",
+            []
+        ),
+        "interview_questions": summary.get(
+            "interview_questions",
+            []
+        )
+    }
+
+    # Exactly 3 interview questions are required by the PRD.
+    questions = clean_summary["interview_questions"][:3]
+
+    while len(questions) < 3:
+        questions.append("")
+
+    clean_summary["interview_questions"] = questions
+
+    result = (
+        supabase
+        .table("applications")
+        .update({
+            "ai_summary": clean_summary,
+            "ai_summary_status": "completed",
+            "ai_summary_generated_at": datetime.utcnow().isoformat()
+        })
+        .eq("id", application_id)
+        .execute()
+    )
+
+    if not result.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Application not found"
+        )
+
+    return {
+        "message": "AI summary saved successfully",
+        "application_id": application_id,
+        "ai_summary_status": "completed"
+    }
+
+
+# ===================================================
+# AI CV SUMMARY — RETRY
+# ===================================================
+
+@app.post("/applications/{application_id}/ai-summary/retry")
+def retry_ai_summary(
+    application_id: str,
+    user: dict = Depends(get_current_user)
+):
+    """
+    Retry AI summary for an assigned recruiter or admin.
+
+    This endpoint ONLY triggers ai_summary_retry.
+    It does NOT send application_received again.
+    """
+    if user.get("role") not in ["recruiter", "admin"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Recruiter or admin access required"
+        )
+
+    application_result = (
+        supabase
+        .table("applications")
+        .select("*")
+        .eq("id", application_id)
+        .execute()
+    )
+
+    if not application_result.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Application not found"
+        )
+
+    application = application_result.data[0]
+
+    if user.get("role") == "recruiter":
+        assignment = (
+            supabase
+            .table("job_recruiters")
+            .select("*")
+            .eq("job_id", application["job_id"])
+            .eq("recruiter_id", user["user_id"])
+            .execute()
+        )
+
+        if not assignment.data:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not assigned to this job"
+            )
+
+    # Mark pending before triggering n8n.
+    supabase.table("applications").update({
+        "ai_summary": None,
+        "ai_summary_status": "pending",
+        "ai_summary_generated_at": None
+    }).eq("id", application_id).execute()
+
+    sent = trigger_ai_summary(
+        application_id,
+        "ai_summary_retry"
+    )
+
+    if not sent:
+        supabase.table("applications").update({
+            "ai_summary_status": "failed"
+        }).eq("id", application_id).execute()
+
+        raise HTTPException(
+            status_code=502,
+            detail="Could not trigger AI summary workflow"
+        )
+
+    return {
+        "message": "AI summary retry started",
+        "application_id": application_id,
+        "ai_summary_status": "pending"
+    }
+
+
+# ===================================================
+# ADMIN — APPLICATION / AI SUMMARY
+# ===================================================
+
+@app.get("/admin/applications/{application_id}")
+def admin_application(
+    application_id: str,
+    user: dict = Depends(get_current_user)
+):
+    require_role(user, "admin")
+
+    result = (
+        supabase
+        .table("applications")
+        .select("*, jobs(*)")
+        .eq("id", application_id)
+        .execute()
+    )
+
+    if not result.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Application not found"
+        )
+
+    return result.data[0]
 
 
 # ===================================================
@@ -1134,12 +1490,6 @@ def change_stage(
         .execute()
     )
 
-    if new_stage == "Interview":
-
-        send_n8n_email(
-            "interview_stage",
-            application_id
-        )
 
     if new_stage == "Hired":
 
@@ -1601,5 +1951,4 @@ def admin_dashboard(
             recruiters
         )
     }
-
 
