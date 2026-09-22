@@ -1,4 +1,3 @@
-
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import (
     Security,
@@ -6,7 +5,8 @@ from fastapi import (
     FastAPI,
     UploadFile,
     File,
-    HTTPException
+    HTTPException,
+    Header
 )
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -19,6 +19,7 @@ from datetime import date, datetime, timedelta
 import os
 import requests
 import uuid
+import secrets
 
 
 app = FastAPI(
@@ -71,24 +72,131 @@ def require_role(user, role):
 
 
 def send_n8n_email(event_type, application_id):
+    """
+    Send an event to the existing n8n webhook.
 
+    The same webhook handles:
+    - application_received
+    - interview_scheduled
+    - hired
+    - rejected
+    - ai_summary_retry
+
+    For application_received / retry, extra application information is
+    included so n8n can download the CV and run the AI summary workflow.
+    """
     webhook = os.getenv("N8N_WEBHOOK_URL")
 
     if not webhook:
-        return
+        print("N8N_WEBHOOK_URL is not configured")
+        return False
 
     try:
-        requests.post(
+        application_result = (
+            supabase
+            .table("applications")
+            .select("*")
+            .eq("id", application_id)
+            .execute()
+        )
+
+        if not application_result.data:
+            print("Application not found for n8n:", application_id)
+            return False
+
+        application = application_result.data[0]
+
+        job_result = (
+            supabase
+            .table("jobs")
+            .select("*")
+            .eq("id", application["job_id"])
+            .execute()
+        )
+
+        job = job_result.data[0] if job_result.data else {}
+
+        candidate_result = (
+            supabase
+            .table("users")
+            .select("id,name,email")
+            .eq("id", application["candidate_id"])
+            .execute()
+        )
+
+        candidate = candidate_result.data[0] if candidate_result.data else {}
+
+        payload = {
+            "event_type": event_type,
+            "application_id": application_id,
+            "candidate_id": application.get("candidate_id"),
+            "candidate_name": candidate.get("name"),
+            "email": candidate.get("email"),
+            "job_id": application.get("job_id"),
+            "job_title": job.get("title"),
+            "job_requirements": job.get("requirements"),
+            "job_qualifications": job.get("qualifications"),
+            "cv_filename": application.get("cv_url"),
+        }
+
+        # Create a short-lived signed URL for n8n to download the CV.
+        # The CV bucket can remain private.
+        cv_filename = application.get("cv_url")
+        if cv_filename:
+            try:
+                signed = (
+                    supabase.storage
+                    .from_("cvs")
+                    .create_signed_url(cv_filename, 600)
+                )
+
+                if isinstance(signed, dict):
+                    payload["cv_signed_url"] = (
+                        signed.get("signedURL")
+                        or signed.get("signedUrl")
+                        or signed.get("signed_url")
+                    )
+            except Exception as e:
+                print("Could not create CV signed URL:", e)
+
+        response = requests.post(
             webhook,
-            json={
-                "event_type": event_type,
-                "application_id": application_id
-            },
+            json=payload,
             timeout=10
         )
 
+        response.raise_for_status()
+        return True
+
     except Exception as e:
         print("n8n error:", e)
+        return False
+
+
+def trigger_ai_summary(application_id, event_type="ai_summary_retry"):
+    """
+    Trigger only the AI summary branch.
+
+    This is deliberately separate from application_received so a retry
+    never sends another application-received email.
+    """
+    return send_n8n_email(event_type, application_id)
+
+
+def get_n8n_callback_secret():
+    return os.getenv("N8N_CALLBACK_SECRET", "")
+
+
+def verify_n8n_callback(secret_header):
+    expected = get_n8n_callback_secret()
+
+    if not expected or not secret_header:
+        return False
+
+    return secrets.compare_digest(
+        str(secret_header),
+        str(expected)
+    )
 
 
 def check_job_open(job):
@@ -416,6 +524,10 @@ def make_recruiter(
     }
 
 
+# ===================================================
+# GET ALL RECRUITERS + ASSIGNED JOBS
+# ===================================================
+
 @app.get("/admin/recruiters")
 def get_recruiters(
     user: dict = Depends(get_current_user)
@@ -423,7 +535,8 @@ def get_recruiters(
 
     require_role(user, "admin")
 
-    result = (
+    # Get all recruiters
+    recruiters_result = (
         supabase
         .table("users")
         .select(
@@ -433,8 +546,85 @@ def get_recruiters(
         .execute()
     )
 
-    return result.data
+    recruiters = recruiters_result.data or []
 
+    if not recruiters:
+        return []
+
+    # Get recruiter IDs
+    recruiter_ids = [
+        recruiter["id"]
+        for recruiter in recruiters
+    ]
+
+    # Get all assignments in one request
+    assignments_result = (
+        supabase
+        .table("job_recruiters")
+        .select("job_id,recruiter_id")
+        .in_("recruiter_id", recruiter_ids)
+        .execute()
+    )
+
+    assignments = assignments_result.data or []
+
+    # Get all job IDs
+    job_ids = list({
+        assignment["job_id"]
+        for assignment in assignments
+    })
+
+    jobs_by_id = {}
+
+    # Get all assigned jobs in one request
+    if job_ids:
+
+        jobs_result = (
+            supabase
+            .table("jobs")
+            .select("*")
+            .in_("id", job_ids)
+            .execute()
+        )
+
+        for job in jobs_result.data or []:
+
+            jobs_by_id[job["id"]] = job
+
+    # Build final recruiter response
+    result = []
+
+    for recruiter in recruiters:
+
+        assigned_jobs = []
+
+        for assignment in assignments:
+
+            if assignment["recruiter_id"] == recruiter["id"]:
+
+                job = jobs_by_id.get(
+                    assignment["job_id"]
+                )
+
+                if job:
+                    assigned_jobs.append(job)
+
+        result.append({
+            "id": recruiter["id"],
+            "name": recruiter["name"],
+            "email": recruiter["email"],
+            "phone": recruiter["phone"],
+            "is_active": recruiter["is_active"],
+            "role": recruiter["role"],
+            "assigned_jobs": assigned_jobs
+        })
+
+    return result
+
+
+# ===================================================
+# DEACTIVATE RECRUITER
+# ===================================================
 
 @app.post("/admin/recruiters/{user_id}/deactivate")
 def deactivate_recruiter(
@@ -467,7 +657,7 @@ def deactivate_recruiter(
 
 
 # ===================================================
-# ADMIN — ASSIGN RECRUITER
+# ADMIN — ASSIGN RECRUITER TO JOB
 # ===================================================
 
 @app.post(
@@ -481,10 +671,11 @@ def assign_recruiter(
 
     require_role(user, "admin")
 
+    # Check recruiter
     recruiter = (
         supabase
         .table("users")
-        .select("*")
+        .select("id,name,email,role")
         .eq("id", recruiter_id)
         .eq("role", "recruiter")
         .execute()
@@ -497,6 +688,40 @@ def assign_recruiter(
             detail="Recruiter not found"
         )
 
+    # Check job
+    job = (
+        supabase
+        .table("jobs")
+        .select("id,title")
+        .eq("id", job_id)
+        .execute()
+    )
+
+    if not job.data:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Job not found"
+        )
+
+    # Check duplicate assignment
+    existing = (
+        supabase
+        .table("job_recruiters")
+        .select("*")
+        .eq("job_id", job_id)
+        .eq("recruiter_id", recruiter_id)
+        .execute()
+    )
+
+    if existing.data:
+
+        return {
+            "message": "Recruiter is already assigned to this job",
+            "data": existing.data
+        }
+
+    # Create assignment
     result = (
         supabase
         .table("job_recruiters")
@@ -527,7 +752,6 @@ async def apply_job(
     require_role(user, "candidate")
 
     # Check file type
-
     if file.content_type != "application/pdf":
 
         raise HTTPException(
@@ -536,11 +760,9 @@ async def apply_job(
         )
 
     # Read CV
-
     cv_data = await file.read()
 
     # Maximum 2 MB
-
     if len(cv_data) > 2 * 1024 * 1024:
 
         raise HTTPException(
@@ -549,7 +771,6 @@ async def apply_job(
         )
 
     # Get job
-
     job_result = (
         supabase
         .table("jobs")
@@ -567,8 +788,7 @@ async def apply_job(
 
     job = job_result.data[0]
 
-    # Check job
-
+    # Check job status
     if not check_job_open(job):
 
         raise HTTPException(
@@ -577,14 +797,22 @@ async def apply_job(
         )
 
     # Check duplicate application
-
     existing = (
         supabase
         .table("applications")
         .select("*")
-        .eq("candidate_id", user["user_id"])
-        .eq("job_id", job_id)
-        .neq("stage", "Withdrawn")
+        .eq(
+            "candidate_id",
+            user["user_id"]
+        )
+        .eq(
+            "job_id",
+            job_id
+        )
+        .neq(
+            "stage",
+            "Withdrawn"
+        )
         .execute()
     )
 
@@ -595,34 +823,10 @@ async def apply_job(
             detail="You already applied for this job"
         )
 
-    # Create application
+    # Generate unique filename
+    filename = f"{uuid.uuid4()}.pdf"
 
-    application = (
-        supabase
-        .table("applications")
-        .insert({
-            "candidate_id": user["user_id"],
-            "job_id": job_id,
-            "stage": "Applied"
-        })
-        .execute()
-    )
-
-    if not application.data:
-
-        raise HTTPException(
-            status_code=500,
-            detail="Application could not be created"
-        )
-
-    application_id = application.data[0]["id"]
-
-    # Unique CV name
-
-    filename = (
-        f"{application_id}_{uuid.uuid4()}.pdf"
-    )
-
+    # Upload CV
     try:
 
         supabase.storage.from_("cvs").upload(
@@ -633,25 +837,66 @@ async def apply_job(
             }
         )
 
-        supabase.table("applications").update({
-            "cv_url": filename
-        }).eq(
-            "id",
-            application_id
-        ).execute()
-
     except Exception as e:
-
-        supabase.table("applications").delete().eq(
-            "id",
-            application_id
-        ).execute()
 
         raise HTTPException(
             status_code=500,
             detail=f"CV upload failed: {str(e)}"
         )
 
+    # Create application
+    try:
+
+        application = (
+            supabase
+            .table("applications")
+            .insert({
+                "candidate_id": user["user_id"],
+                "job_id": job_id,
+                "cv_url": filename,
+                "stage": "Applied",
+                "ai_summary": None,
+                "ai_summary_status": "pending",
+                "ai_summary_generated_at": None
+            })
+            .execute()
+        )
+
+    except Exception as e:
+
+        try:
+
+            supabase.storage.from_(
+                "cvs"
+            ).remove([filename])
+
+        except:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Application could not be created: {str(e)}"
+        )
+
+    if not application.data:
+
+        try:
+
+            supabase.storage.from_(
+                "cvs"
+            ).remove([filename])
+
+        except:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail="Application could not be created"
+        )
+
+    application_id = application.data[0]["id"]
+
+    # Send email automation
     send_n8n_email(
         "application_received",
         application_id
@@ -660,7 +905,8 @@ async def apply_job(
     return {
         "message": "Application submitted successfully",
         "application_id": application_id,
-        "stage": "Applied"
+        "stage": "Applied",
+        "cv_url": filename
     }
 
 
@@ -679,11 +925,22 @@ def my_applications(
         supabase
         .table("applications")
         .select("*, jobs(*)")
-        .eq("candidate_id", user["user_id"])
+        .eq(
+            "candidate_id",
+            user["user_id"]
+        )
         .execute()
     )
 
-    return result.data
+    applications = result.data or []
+
+    # AI summaries are private to admins and assigned recruiters.
+    for application in applications:
+        application.pop("ai_summary", None)
+        application.pop("ai_summary_status", None)
+        application.pop("ai_summary_generated_at", None)
+
+    return applications
 
 
 # ===================================================
@@ -704,8 +961,14 @@ def withdraw_application(
         supabase
         .table("applications")
         .select("*")
-        .eq("id", application_id)
-        .eq("candidate_id", user["user_id"])
+        .eq(
+            "id",
+            application_id
+        )
+        .eq(
+            "candidate_id",
+            user["user_id"]
+        )
         .execute()
     )
 
@@ -734,7 +997,10 @@ def withdraw_application(
         .update({
             "stage": "Withdrawn"
         })
-        .eq("id", application_id)
+        .eq(
+            "id",
+            application_id
+        )
         .execute()
     )
 
@@ -742,6 +1008,242 @@ def withdraw_application(
         "message": "Application withdrawn",
         "application": updated.data
     }
+
+
+# ===================================================
+# AI CV SUMMARY — INTERNAL n8n CALLBACK
+# ===================================================
+
+@app.post("/internal/ai-summary")
+def save_ai_summary(
+    payload: dict,
+    x_n8n_secret: str = Header(default="")
+):
+    """
+    n8n calls this endpoint after the AI creates the summary.
+
+    n8n must send the secret in:
+    X-N8N-Secret: <N8N_CALLBACK_SECRET>
+
+    Expected JSON:
+    {
+        "application_id": "...",
+        "status": "completed",
+        "summary": {
+            "short_profile": ["...", "..."],
+            "requirements_mentioned": ["..."],
+            "requirements_not_found": ["..."],
+            "interview_questions": ["...", "...", "..."]
+        }
+    }
+
+    No JWT is used here because n8n is a server-to-server caller.
+    The secret protects this endpoint.
+    """
+    if not verify_n8n_callback(x_n8n_secret):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid n8n callback secret"
+        )
+
+    application_id = payload.get("application_id")
+    status = payload.get("status", "completed")
+
+    if not application_id:
+        raise HTTPException(
+            status_code=400,
+            detail="application_id is required"
+        )
+
+    if status == "failed":
+        result = (
+            supabase
+            .table("applications")
+            .update({
+                "ai_summary": None,
+                "ai_summary_status": "failed"
+            })
+            .eq("id", application_id)
+            .execute()
+        )
+
+        if not result.data:
+            raise HTTPException(
+                status_code=404,
+                detail="Application not found"
+            )
+
+        return {
+            "message": "AI summary marked as failed",
+            "application_id": application_id
+        }
+
+    summary = payload.get("summary")
+
+    if not summary:
+        raise HTTPException(
+            status_code=400,
+            detail="summary is required"
+        )
+
+    # Keep the stored structure limited to the exact 3 PRD sections.
+    clean_summary = {
+        "short_profile": summary.get("short_profile", []),
+        "requirements_mentioned": summary.get(
+            "requirements_mentioned",
+            []
+        ),
+        "requirements_not_found": summary.get(
+            "requirements_not_found",
+            []
+        ),
+        "interview_questions": summary.get(
+            "interview_questions",
+            []
+        )
+    }
+
+    # Exactly 3 interview questions are required by the PRD.
+    questions = clean_summary["interview_questions"][:3]
+
+    while len(questions) < 3:
+        questions.append("")
+
+    clean_summary["interview_questions"] = questions
+
+    result = (
+        supabase
+        .table("applications")
+        .update({
+            "ai_summary": clean_summary,
+            "ai_summary_status": "completed",
+            "ai_summary_generated_at": datetime.utcnow().isoformat()
+        })
+        .eq("id", application_id)
+        .execute()
+    )
+
+    if not result.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Application not found"
+        )
+
+    return {
+        "message": "AI summary saved successfully",
+        "application_id": application_id,
+        "ai_summary_status": "completed"
+    }
+
+
+# ===================================================
+# AI CV SUMMARY — RETRY
+# ===================================================
+
+@app.post("/applications/{application_id}/ai-summary/retry")
+def retry_ai_summary(
+    application_id: str,
+    user: dict = Depends(get_current_user)
+):
+    """
+    Retry AI summary for an assigned recruiter or admin.
+
+    This endpoint ONLY triggers ai_summary_retry.
+    It does NOT send application_received again.
+    """
+    if user.get("role") not in ["recruiter", "admin"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Recruiter or admin access required"
+        )
+
+    application_result = (
+        supabase
+        .table("applications")
+        .select("*")
+        .eq("id", application_id)
+        .execute()
+    )
+
+    if not application_result.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Application not found"
+        )
+
+    application = application_result.data[0]
+
+    if user.get("role") == "recruiter":
+        assignment = (
+            supabase
+            .table("job_recruiters")
+            .select("*")
+            .eq("job_id", application["job_id"])
+            .eq("recruiter_id", user["user_id"])
+            .execute()
+        )
+
+        if not assignment.data:
+            raise HTTPException(
+                status_code=403,
+                detail="You are not assigned to this job"
+            )
+
+    # Mark pending before triggering n8n.
+    supabase.table("applications").update({
+        "ai_summary": None,
+        "ai_summary_status": "pending",
+        "ai_summary_generated_at": None
+    }).eq("id", application_id).execute()
+
+    sent = trigger_ai_summary(
+        application_id,
+        "ai_summary_retry"
+    )
+
+    if not sent:
+        supabase.table("applications").update({
+            "ai_summary_status": "failed"
+        }).eq("id", application_id).execute()
+
+        raise HTTPException(
+            status_code=502,
+            detail="Could not trigger AI summary workflow"
+        )
+
+    return {
+        "message": "AI summary retry started",
+        "application_id": application_id,
+        "ai_summary_status": "pending"
+    }
+
+
+# ===================================================
+# ADMIN — APPLICATION / AI SUMMARY
+# ===================================================
+
+@app.get("/admin/applications/{application_id}")
+def admin_application(
+    application_id: str,
+    user: dict = Depends(get_current_user)
+):
+    require_role(user, "admin")
+
+    result = (
+        supabase
+        .table("applications")
+        .select("*, jobs(*)")
+        .eq("id", application_id)
+        .execute()
+    )
+
+    if not result.data:
+        raise HTTPException(
+            status_code=404,
+            detail="Application not found"
+        )
+
+    return result.data[0]
 
 
 # ===================================================
@@ -755,15 +1257,44 @@ def recruiter_jobs(
 
     require_role(user, "recruiter")
 
-    result = (
+    recruiter_id = user["user_id"]
+
+    # Get assigned job IDs
+    assignments_result = (
         supabase
         .table("job_recruiters")
-        .select("*, jobs(*)")
-        .eq("recruiter_id", user["user_id"])
+        .select("job_id")
+        .eq(
+            "recruiter_id",
+            recruiter_id
+        )
         .execute()
     )
 
-    return result.data
+    assignments = assignments_result.data or []
+
+    if not assignments:
+        return []
+
+    # Get job IDs
+    job_ids = list({
+        assignment["job_id"]
+        for assignment in assignments
+    })
+
+    # Get all jobs in one request
+    jobs_result = (
+        supabase
+        .table("jobs")
+        .select("*")
+        .in_(
+            "id",
+            job_ids
+        )
+        .execute()
+    )
+
+    return jobs_result.data or []
 
 
 # ===================================================
@@ -780,12 +1311,23 @@ def recruiter_applications(
 
     require_role(user, "recruiter")
 
+    recruiter_id = user["user_id"]
+
+    # Check assignment
     assignment = (
         supabase
         .table("job_recruiters")
-        .select("*")
-        .eq("job_id", job_id)
-        .eq("recruiter_id", user["user_id"])
+        .select(
+            "job_id,recruiter_id"
+        )
+        .eq(
+            "job_id",
+            job_id
+        )
+        .eq(
+            "recruiter_id",
+            recruiter_id
+        )
         .execute()
     )
 
@@ -796,11 +1338,15 @@ def recruiter_applications(
             detail="You are not assigned to this job"
         )
 
+    # Get applications
     result = (
         supabase
         .table("applications")
-        .select("*, users(*), jobs(*)")
-        .eq("job_id", job_id)
+        .select("*")
+        .eq(
+            "job_id",
+            job_id
+        )
         .execute()
     )
 
@@ -826,7 +1372,10 @@ def change_stage(
         supabase
         .table("applications")
         .select("*")
-        .eq("id", application_id)
+        .eq(
+            "id",
+            application_id
+        )
         .execute()
     )
 
@@ -845,8 +1394,14 @@ def change_stage(
         supabase
         .table("job_recruiters")
         .select("*")
-        .eq("job_id", job_id)
-        .eq("recruiter_id", user["user_id"])
+        .eq(
+            "job_id",
+            job_id
+        )
+        .eq(
+            "recruiter_id",
+            user["user_id"]
+        )
         .execute()
     )
 
@@ -928,16 +1483,13 @@ def change_stage(
         .update({
             "stage": new_stage
         })
-        .eq("id", application_id)
+        .eq(
+            "id",
+            application_id
+        )
         .execute()
     )
 
-    if new_stage == "Interview":
-
-        send_n8n_email(
-            "interview_stage",
-            application_id
-        )
 
     if new_stage == "Hired":
 
@@ -950,7 +1502,10 @@ def change_stage(
             supabase
             .table("jobs")
             .select("*")
-            .eq("id", job_id)
+            .eq(
+                "id",
+                job_id
+            )
             .execute()
         )
 
@@ -962,16 +1517,26 @@ def change_stage(
                 supabase
                 .table("applications")
                 .select("id")
-                .eq("job_id", job_id)
-                .eq("stage", "Hired")
+                .eq(
+                    "job_id",
+                    job_id
+                )
+                .eq(
+                    "stage",
+                    "Hired"
+                )
                 .execute()
             )
 
-            hired_count = len(hired_result.data)
+            hired_count = len(
+                hired_result.data
+            )
 
             if hired_count >= job["openings"]:
 
-                supabase.table("jobs").update({
+                supabase.table(
+                    "jobs"
+                ).update({
                     "status": "Closed"
                 }).eq(
                     "id",
@@ -999,7 +1564,9 @@ def change_stage(
 
                 for app in remaining.data:
 
-                    supabase.table("applications").update({
+                    supabase.table(
+                        "applications"
+                    ).update({
                         "stage": "Rejected"
                     }).eq(
                         "id",
@@ -1043,7 +1610,10 @@ def schedule_interview(
         supabase
         .table("applications")
         .select("*")
-        .eq("id", application_id)
+        .eq(
+            "id",
+            application_id
+        )
         .execute()
     )
 
@@ -1072,8 +1642,14 @@ def schedule_interview(
         supabase
         .table("job_recruiters")
         .select("*")
-        .eq("job_id", job_id)
-        .eq("recruiter_id", user["user_id"])
+        .eq(
+            "job_id",
+            job_id
+        )
+        .eq(
+            "recruiter_id",
+            user["user_id"]
+        )
         .execute()
     )
 
@@ -1115,8 +1691,14 @@ def schedule_interview(
         supabase
         .table("interviews")
         .select("*")
-        .eq("recruiter_id", user["user_id"])
-        .eq("interview_date", data.interview_date)
+        .eq(
+            "recruiter_id",
+            user["user_id"]
+        )
+        .eq(
+            "interview_date",
+            data.interview_date
+        )
         .execute()
     )
 
@@ -1167,7 +1749,9 @@ def schedule_interview(
         .execute()
     )
 
-    supabase.table("applications").update({
+    supabase.table(
+        "applications"
+    ).update({
         "stage": "Interview"
     }).eq(
         "id",
@@ -1204,7 +1788,10 @@ def add_note(
         supabase
         .table("applications")
         .select("*")
-        .eq("id", application_id)
+        .eq(
+            "id",
+            application_id
+        )
         .execute()
     )
 
@@ -1267,84 +1854,101 @@ def admin_dashboard(
 
     require_role(user, "admin")
 
-    jobs = (
+    # Get all jobs
+    jobs_result = (
         supabase
         .table("jobs")
-        .select("*")
+        .select("id,status")
         .execute()
     )
 
-    applications = (
+    # Get all applications
+    applications_result = (
         supabase
         .table("applications")
-        .select("*")
+        .select("id,stage")
         .execute()
     )
 
-    recruiters = (
+    # Get all recruiters
+    recruiters_result = (
         supabase
         .table("users")
         .select("id")
-        .eq("role", "recruiter")
+        .eq(
+            "role",
+            "recruiter"
+        )
         .execute()
     )
 
+    jobs = jobs_result.data or []
+    applications = applications_result.data or []
+    recruiters = recruiters_result.data or []
+
     return {
-        "total_jobs": len(jobs.data),
+        "total_jobs": len(jobs),
 
-        "open_jobs": len([
-            j for j in jobs.data
-            if j["status"] == "Open"
-        ]),
-
-        "closed_jobs": len([
-            j for j in jobs.data
-            if j["status"] == "Closed"
-        ]),
-
-        "total_applications": len(
-            applications.data
+        "open_jobs": sum(
+            1
+            for job in jobs
+            if job.get("status") == "Open"
         ),
 
-        "applied": len([
-            a for a in applications.data
-            if a["stage"] == "Applied"
-        ]),
+        "closed_jobs": sum(
+            1
+            for job in jobs
+            if job.get("status") == "Closed"
+        ),
 
-        "shortlisted": len([
-            a for a in applications.data
-            if a["stage"] == "Shortlisted"
-        ]),
+        "total_applications": len(
+            applications
+        ),
 
-        "interview": len([
-            a for a in applications.data
-            if a["stage"] == "Interview"
-        ]),
+        "applied": sum(
+            1
+            for app in applications
+            if app.get("stage") == "Applied"
+        ),
 
-        "offer": len([
-            a for a in applications.data
-            if a["stage"] == "Offer"
-        ]),
+        "shortlisted": sum(
+            1
+            for app in applications
+            if app.get("stage") == "Shortlisted"
+        ),
 
-        "hired": len([
-            a for a in applications.data
-            if a["stage"] == "Hired"
-        ]),
+        "interview": sum(
+            1
+            for app in applications
+            if app.get("stage") == "Interview"
+        ),
 
-        "rejected": len([
-            a for a in applications.data
-            if a["stage"] == "Rejected"
-        ]),
+        "offer": sum(
+            1
+            for app in applications
+            if app.get("stage") == "Offer"
+        ),
 
-        "withdrawn": len([
-            a for a in applications.data
-            if a["stage"] == "Withdrawn"
-        ]),
+        "hired": sum(
+            1
+            for app in applications
+            if app.get("stage") == "Hired"
+        ),
+
+        "rejected": sum(
+            1
+            for app in applications
+            if app.get("stage") == "Rejected"
+        ),
+
+        "withdrawn": sum(
+            1
+            for app in applications
+            if app.get("stage") == "Withdrawn"
+        ),
 
         "total_recruiters": len(
-            recruiters.data
+            recruiters
         )
     }
-
-
 
