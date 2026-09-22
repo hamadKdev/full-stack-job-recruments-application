@@ -1,0 +1,7 @@
+{
+  "name": "Job Recruitment / Applicant Tracking System",
+  "description": "Production-style applicant tracking system connecting candidates, recruiters, and administrators with real-time job listings, stage management, interview scheduling, and application tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
